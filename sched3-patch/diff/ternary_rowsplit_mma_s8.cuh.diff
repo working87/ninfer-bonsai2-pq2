@@ -1,0 +1,36 @@
+﻿diff --git "a/E:\\infer-build\\srcbackup\\20260926-sched3\\ternary_rowsplit_mma_s8.cuh" "b/E:\\infer-build\\gpu-samples\\src-sched3\\src\\ops\\linear\\ternary\\ternary_rowsplit_mma_s8.cuh"
+index ea7a684..3aabec1 100644
+--- "a/E:\\infer-build\\srcbackup\\20260926-sched3\\ternary_rowsplit_mma_s8.cuh"
++++ "b/E:\\infer-build\\gpu-samples\\src-sched3\\src\\ops\\linear\\ternary\\ternary_rowsplit_mma_s8.cuh"
+@@ -301,7 +301,11 @@ void ternary_pq2_mma_s8_kernel(const std::int8_t* __restrict__ act_codes,
+                                std::int32_t out_row_stride,
+                                // PTQ1_0 high plane; unused (and unread) when kPtq1 == false, hence
+                                // the default so the PQ2_0 call site does not have to name it.
+-                               const std::uint8_t* __restrict__ w_high = nullptr) {
++                               const std::uint8_t* __restrict__ w_high = nullptr,
++                               // SCHED3 CHANGE 3 on the int8 rung; see the long note in
++                               // ternary_rowsplit_mma_small_t.cuh. The token tile is grid.y when
++                               // true, and the old serial walk when false.
++                               bool token_grid = false) {
+     using Storage = TernaryS8Storage<Tokens_, Warps_, kPtq1>;
+     static_assert(Tokens_ % 8 == 0, "token tile must be whole 8-token mma column groups");
+     static_assert(Tokens_ <= 64, "the activation tile is sized for one wide token tile");
+@@ -494,7 +498,16 @@ void ternary_pq2_mma_s8_kernel(const std::int8_t* __restrict__ act_codes,
+     const int b_row  = lane & 7;                 // activation row (token) for ldmatrix matrix 0
+     const int b_col  = ((lane >> 3) & 1) * 16;
+ 
+-    for (int tok_base = 0; tok_base < tokens; tok_base += kTokens) {
++    // SCHED3 CHANGE 3: the token tile is grid.y when the switch is on (one tile per CTA); with
++    // NINFER_TERNARY_TOKEN_GRID=0 the tiles are walked serially here, exactly as before. Per-tile
++    // state is declared inside the loop, so the tiles are independent and this is a
++    // re-partitioning of work, not a numerics change.
++    const int tok_tiles = token_grid ? 1 : ((tokens + kTokens - 1) / kTokens);
++    const int tok_base0 = token_grid ? static_cast<int>(blockIdx.y) * kTokens : 0;
++    if (tok_base0 >= tokens) { return; }
++
++    for (int tok_tile = 0; tok_tile < tok_tiles; ++tok_tile) {
++        const int tok_base = tok_base0 + tok_tile * kTokens;
+         float acc[kSubTiles][4];
+ #pragma unroll
+         for (int sub = 0; sub < kSubTiles; ++sub) {
+

@@ -1,0 +1,48 @@
+{
+  "schema": "ninfer-package-defaults/1",
+  "audience": "agent",
+  "note": "These ARE the package defaults: an agent should apply them without asking. Every value here is measured, and the file is the single place to change a default.",
+
+  "kv_dtype": { "8.9": "fp8", "12.0": "fp8" },
+  "kv_dtype_note": "fp8 works on both arches and is the speed tier. Switch to the 4-bit capacity tier only when the context must grow: rk4v4 on 8.9, nvfp4 on 12.0 (rk4v4 is REJECTED on a 12.0 card).",
+
+  "spec": {
+    "prefer": "dflash2",
+    "k": 7,
+    "lm_head_draft": true,
+    "fallback_spec": "mtp",
+    "fallback_k": 3,
+    "note": "Measured on an RTX 5090 D, same binary, no rebuild: MTP d3 250-268 t/s, best MTP 343.8, DFlash2 K=7 512.9 on predictable content and 154.7 on prose. DFlash2 needs its own artifact and --lm-head-draft is mandatory (without it the engine dies with linear_topk: unsupported head profile)."
+  },
+
+  "ctx_by_vram_mib": [
+    { "min": 20000, "ctx": 131072 },
+    { "min": 15000, "ctx": 32768 },
+    { "min": 0,     "ctx": 16384 }
+  ],
+  "ctx_note": "With fp8 KV the KV term is about 32 KiB per token: 131072 costs about 4 GiB. The engine refuses a context that does not fit and prints how many bytes are missing, so a wrong value fails loudly, not silently.",
+
+  "engine_args": ["--prefill-chunk", "1024"],
+  "engine_args_note": "1024 was swept against 128..2048 and won; it is passed explicitly so a future engine default cannot silently change it.",
+
+  "rung_switches": {
+    "NINFER_TERNARY_S8_MIN_TOKENS": 33,
+    "NINFER_TERNARY_WIDE_MIN_TOKENS": 41,
+    "NINFER_TERNARY_S8": 1,
+    "NINFER_TERNARY_MMA": 1,
+    "NINFER_TERNARY_PTQ1_FAST": 1
+  },
+  "rung_note": "33 is our card's crossing point and is deliberately NOT lowered (on our card 17 makes T=16..31 slower and its PPL 0.025 percent worse). The crossing is a property of the CARD, so the value is exposed as an env: sweep it on one binary with `sweep`, and prove the arm ran with the probe (s8_min=). Set these explicitly at every start so the run is self-documenting.",
+
+  "compiled_into_the_engines_shipped_here": [
+    "sm_120: -DNINFER_SM120=1 -DNINFER_SM_COUNT=170 (RTX 5090/5090D wave geometry)",
+    "sm_89:  -DNINFER_CUDA_ARCH=89 (Ada tier, rk4v4 KV kernels available)",
+    "both:   int8 threshold overridable at runtime, no rebuild needed"
+  ],
+
+  "do_not_change_without_measuring": [
+    "K above 7 (a round cost of 8 or more drafts leaves the small-batch rung and the cost jumps about 3x)",
+    "context under the VRAM class above (it is a capacity limit, not a preference)",
+    "the KV dtype on a 12.0 card to rk4v4 (rejected by the engine)"
+  ]
+}

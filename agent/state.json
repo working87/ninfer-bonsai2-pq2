@@ -1,0 +1,9 @@
+{
+  "_what": "must-do state ledger: what has already been done / verified ON THIS MACHINE, with evidence",
+  "_why": "so the next agent does not repeat work, and does not believe work was done when it was not",
+  "_how_to_write": "append to done[] : {\"id\":\"E1\",\"at\":\"<ISO8601>\",\"evidence\":\"<sha256 or log path>\",\"note\":\"...\"}. This file is MEANT to be written.",
+  "_machine": "",
+  "done": [],
+  "skipped": [],
+  "notes": []
+}

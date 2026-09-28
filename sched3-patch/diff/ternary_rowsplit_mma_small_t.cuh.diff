@@ -1,0 +1,663 @@
+﻿diff --git "a/E:\\infer-build\\srcbackup\\20260926-sched3\\ternary_rowsplit_mma_small_t.cuh" "b/E:\\infer-build\\gpu-samples\\src-sched3\\src\\ops\\linear\\ternary\\ternary_rowsplit_mma_small_t.cuh"
+index a58529e..74f8b66 100644
+--- "a/E:\\infer-build\\srcbackup\\20260926-sched3\\ternary_rowsplit_mma_small_t.cuh"
++++ "b/E:\\infer-build\\gpu-samples\\src-sched3\\src\\ops\\linear\\ternary\\ternary_rowsplit_mma_small_t.cuh"
+@@ -72,12 +72,207 @@ inline constexpr int kTernaryMmaActStride       = kTernaryMmaChunkK + 8; // 16B-
+ inline constexpr int kTernaryMmaStages          = 2;
+ inline constexpr int kTernaryMmaThreads         = kTernaryMmaWarpsPerCta * 32;
+ 
++// The mma m-fragment height. A warp owns its rows in whole 16-row tiles, which is what makes the
++// row block below expressible as a multiple of this.
++inline constexpr int kTernaryMmaTileRows        = 16;
++
++// ============================================================================================
++// SCHED3 CHANGE 1 -- per-shape ROW-BLOCK bucketing (rows per WARP, chosen from `n`)
++// ============================================================================================
++// PROVENANCE. The bucketing is ported from the sibling ternary line, which reports the direction
++// and the threshold below. NO PERCENTAGE IS QUOTED HERE ON PURPOSE: the magnitudes were measured on
++// that line's kernel, not on this one, and nothing in this tree reproduces them. Treat the numbers
++// in the SCHED3 report as expectations to be verified by the A/B, not as established facts.
++//
++// WHAT IT IS. kTernaryMmaRowsPerWarp (16) is the number of output rows ONE warp accumulates, and
++// the CTA covers kRowsPerWarp * kTernaryMmaWarpsPerCta of them. That product decides two things at
++// once, and they pull in opposite directions:
++//
++//   * CTA count. rows_per_cta = kRowsPerWarp * 4, so grid.x = ceil(n / rows_per_cta). At 16 rows a
++//     N=5120 projection gets 5120/64 = 80 CTAs; at 32 it would get 40, i.e. half the card idle.
++//     A NARROW shape must therefore stay at 16. (80 CTAs is one wave on this part -- the original
++//     note next to kTernaryMmaWarpsPerCta says "80 SMs"; the NINFER_SM_COUNT this tree is built
++//     with is 76, and that discrepancy is an open item in the SCHED3 report, so no SM count is
++//     asserted here.)
++//   * activation traffic. A chunk's activation tile is staged ONCE per CTA and consumed by every
++//     row that CTA owns, so the activation bytes per output row halve every time kRowsPerWarp
++//     doubles. On a WIDE shape (n = 17408 and up) the CTA count is not the binding constraint and
++//     32 rows per warp is the cheaper load mix -- in principle. This kernel was only ever TUNED at
++//     16, so "wide shapes prefer 32" is an expectation, not a local measurement.
++//
++// THE BUCKET. n <= 5120 -> 16 rows/warp; n > 5120 -> 32 rows/warp, WHERE THE FORMAT CAN BUY IT.
++// The row block is bounded by the 48 KB static shared cap (there is no dynamic-shared opt-in on
++// this path -- see the staging note in the kernel), and the footprint grows linearly in it:
++//
++//     PQ2_0   16 rows -> 38,144 B   |  32 rows -> 57,600 B  OVER CAP
++//     PTQ1_0  16 rows -> 24,320 B   |  32 rows -> 40,192 B  fits
++//     (both formats at 48 rows: 56,064 B / 77,056 B, over cap)
++//
++// So the wide row block is a PTQ1_0 instantiation. For PQ2_0 the bucket clamps back to 16 with the
++// footprint as the reason -- making 32 rows fit there would mean narrowing the PQ2_0 chunk from 512
++// to 256, which is a staging change and not a scheduling one. A 48-row block is buildable for
++// NEITHER format, so it does not exist here; the sibling line's "global 48" arm cannot be
++// reproduced in this kernel at all.
++//
++// This is enforced, not documented-and-hoped: see the footprint static_asserts after the storage
++// type, and the kPtq1 parameter of ternary_mma_rows_per_warp below.
++//
++// BIT-EXACTNESS. The row block changes WHICH rows a warp owns, and nothing else. Every output
++// element's accumulation chain is untouched: the k loop still runs chunk by chunk, group by group,
++// k-step by k-step in exactly the same order, and each group's scale is still folded with the same
++// fmaf. Rows never cooperate on this path (there is no cross-warp reduction), so re-partitioning
++// them cannot reorder a single addition. Change 1 is bit-identical to the row block it replaces,
++// element for element.
++//
++// NINFER_TERNARY_SMALL_T_ROWS=auto|16|32 -- read once: the choice decides which kernel enters the
++// captured CUDA graph, so it must not change between graph construction and replay. 32 is rejected
++// (falls back to auto) for a shape whose format cannot carry it.
++inline constexpr int kTernaryMmaRowsNarrowMax = 5120; // n <= this keeps the narrow row block
++inline constexpr int kTernaryMmaRowsNarrow    = 16;
++inline constexpr int kTernaryMmaRowsWide      = 32;
++
++[[nodiscard]] inline int ternary_mma_rows_per_warp(std::int32_t rows, bool wide_allowed) {
++    static const int forced = [] {
++        const char* value = std::getenv("NINFER_TERNARY_SMALL_T_ROWS");
++        if (value == nullptr) { return 0; }
++        const std::string text(value);
++        if (text.empty() || text == "auto") { return 0; }
++        const int parsed = std::atoi(value);
++        return parsed == kTernaryMmaRowsNarrow || parsed == kTernaryMmaRowsWide ? parsed : 0;
++    }();
++    if (forced == kTernaryMmaRowsNarrow) { return kTernaryMmaRowsNarrow; }
++    if (forced == kTernaryMmaRowsWide) {
++        return wide_allowed ? kTernaryMmaRowsWide : kTernaryMmaRowsNarrow;
++    }
++    if (!wide_allowed) { return kTernaryMmaRowsNarrow; }
++    return rows <= kTernaryMmaRowsNarrowMax ? kTernaryMmaRowsNarrow : kTernaryMmaRowsWide;
++}
++
++static_assert(kTernaryMmaRowsNarrow % kTernaryMmaTileRows == 0 &&
++                  kTernaryMmaRowsWide % kTernaryMmaTileRows == 0,
++              "every row block must be a whole number of 16-row mma tiles");
++// A row block is bounded above by ONE WARP's lane count, and that is a correctness bound, not a
++// taste one: the PTQ1_0 high-plane staging moves a row per lane as a single-shot
++// `if (lane < kRowsPerWarp)` copy (a stride loop was never needed at 16 rows). A wider block would
++// silently leave rows 32.. un-staged, so it is rejected here rather than debugged later.
++static_assert(kTernaryMmaRowsWide <= 32,
++              "the qh/high-plane staging is one copy per lane; a row block wider than one warp "
++              "needs a strided loop first");
++
+ static_assert((kTernaryMmaRowStride % 16) == 0, "cp.async needs a 16-byte aligned row start");
+ static_assert(kTernaryMmaRowStride >= kTernaryMmaCodesPerRow, "the row must hold a whole chunk");
+ static_assert((kTernaryMmaActStride % 8) == 0, "ldmatrix wants 8-element row starts");
+ static_assert((kTernaryMmaChunkK % kTernaryMmaGroupK) == 0, "chunks must be whole groups");
+ static_assert((kTernaryMmaChunkK % 16) == 0, "chunks must be whole mma k-steps");
+ 
++// ============================================================================================
++// SCHED3 CHANGE 3 -- the TOKEN TILE moves from the serial in-kernel loop into blockIdx.y
++// ============================================================================================
++// PROVENANCE NOTE, because the handover's one-line description of this change is easy to misread.
++// The serialisation being removed is NOT on the host: the host issues ONE launch, and it always
++// did. The serial loop is INSIDE the kernel (the 8-token tile walk this replaces), and the change
++// buys PARALLELISM / tail utilisation -- not bandwidth. Grid geometry is all that changes here: the
++// total DRAM traffic is identical in both directions, and the byte count per CTA is unchanged too.
++// No percentage is quoted, for the same reason as change 1: the magnitude was measured on the
++// sibling line's kernel, not here.
++//
++// WHAT IT IS. The kernel walks the sequence in 8-token tiles, and each tile is a COMPLETE,
++// independent pass: register accumulators are declared and zeroed at the top of the tile body, the
++// whole K loop runs, the tile's results are stored, and the next tile starts from zero again. There
++// is no carry of any kind between tiles -- not in the accumulators, not in the weight staging
++// (which is re-staged from the top of K for every tile anyway), not in the activation tile.
++//
++// So the tile index does not have to stay a loop. Lifting it into grid.y turns
++// ceil(T/8) sequential passes inside ONE CTA into ceil(T/8) independent CTAs on the same rows:
++//
++//   before: grid = (ceil(n / rows_per_cta), 1)          one CTA per row block, 64 x T/8 work
++//   after : grid = (ceil(n / rows_per_cta), ceil(T/8))  one CTA per (row block, token tile)
++//
++// WHY IT MATTERS. On a prefill-shaped call the row-block count is small (N=5120 at 64 rows/CTA is
++// 80 CTAs = one wave on this part) while every one of them then walks all T/8 token tiles SERIALLY,
++// so the machine runs out of CTAs long before it runs out of work. Splitting the tile axis over
++// grid.y refills it from parallelism that was already there. Total DRAM traffic is unchanged in
++// both directions: the weight bytes a CTA reads are (its rows) x (its own tile's K walks), which is
++// the same set of
++// reads whether they come from one CTA looping or from T/8 CTAs each doing one tile.
++//
++// BIT-EXACTNESS. This is a pure re-partitioning of independent work: every (row, token) output
++// element is produced by exactly the same instruction sequence over exactly the same inputs, in the
++// same order, as before. Nothing is reduced, reassociated or reordered. Guarded by the same
++// argument as change 1.
++//
++// NINFER_TERNARY_TOKEN_GRID=0 restores the serial walk in the same binary (the A/B control arm).
++inline constexpr int kTernaryMmaTokenTilesPerCta = 1; // one token tile per CTA with the grid on
++
++[[nodiscard]] inline bool ternary_token_grid_enabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("NINFER_TERNARY_TOKEN_GRID");
++        return value == nullptr || std::string(value) != "0";
++    }();
++    return enabled;
++}
++
++// ============================================================================================
++// SCHED3 CHANGE 2 -- K-SPLIT ADMISSION (small_t)
++// ============================================================================================
++// WHAT IT IS, AND WHY IT IS THE ONE CHANGE THAT IS **NOT** BIT-IDENTICAL.
++// Splitting K across two launches means the per-row accumulation is no longer one chain over the
++// whole K: shard 0 produces a rounded result, and shard 1 adds its own partial on top of it
++// (one extra bf16 rounding per output element, plus a blank-slate restart). Deterministic, but NOT
++// bit-identical to the unsplit chain -- mathematically the same sum, numerically a different
++// association. Every other scheduling knob here preserves the chain exactly; this one cannot, and
++// that is a real, reportable difference rather than a formality (see the SCHED3 report).
++//
++// WHY SPLIT AT ALL: on a NARROW-ROW, WIDE-K shape the row-block axis alone cannot fill the card.
++// n = 5120 at 64 rows/CTA is 80 CTAs (one wave), each walking all 34 chunks of K = 17408 serially;
++// two K shards make that 160 CTAs and halve the serial depth. DRAM traffic is unchanged: each shard
++// reads its own half of the weights, and only the activation tile is read twice (L2-resident).
++//
++// THE GATE. Its three conditions, exactly as handed over by the sibling line (which reports that a
++// wider gate loses ground; no percentage is quoted here because nothing in this tree reproduces it):
++//     tokens <= 8   the speculative verify pass, where the K walk is the latency that matters
++//     n     <= 6144 a NARROW row count: wide shapes already have enough CTAs without splitting
++//     >= 4 chunks per shard   below that the split's own second launch and second activation pass
++//                             outweigh the parallelism it buys
++// NOTE ON THE THRESHOLD'S PROVENANCE: the ">= 4" reading is CHUNKS PER SHARD, and "chunks" here are
++// 512-wide K chunks (34 of them at K=17408). The handover said "at least 4 K steps per shard", which
++// could also be read as four 16-wide mma k-steps; the stricter chunk reading is the one implemented,
++// and it is what makes the divisibility condition below meaningful. If the intent was the looser one,
++// this constant is the single place to change.
++// With the thresholds above, exactly one weight shape in this model can satisfy them, and it is the
++// narrow-row / widest-K one (n = 5120, k = 17408 at T <= 8).
++//
++// NINFER_TERNARY_KSPLIT=1 turns it on. IT IS OFF BY DEFAULT ON PURPOSE: it is the only change of
++// the three that alters the numerics, so it must be opted into and validated on the card before it
++// is allowed into a default arm (the other two are bit-identical and need no such gate).
++inline constexpr int kTernaryMmaKSplitMaxTokens          = 8;
++inline constexpr int kTernaryMmaKSplitMaxRows            = 6144;
++inline constexpr int kTernaryMmaKSplitMinChunksPerShard  = 4;
++inline constexpr int kTernaryMmaKSplitShards             = 2;
++
++[[nodiscard]] inline bool ternary_mma_ksplit_enabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("NINFER_TERNARY_KSPLIT");
++        return value != nullptr && std::string(value) == "1";
++    }();
++    return enabled;
++}
++
++// Number of K shards to launch, 1 = no split. Checks the divisibility itself rather than trusting
++// the gate: a shard boundary that does not fall on a whole chunk would drop or double-count weight
++// rows, so every condition below is a correctness condition, not a tuning one.
++[[nodiscard]] inline int ternary_mma_ksplit_shards(std::int32_t rows, std::int32_t k,
++                                                   std::int32_t tokens) {
++    if (!ternary_mma_ksplit_enabled()) { return 1; }
++    if (tokens <= 0 || tokens > kTernaryMmaKSplitMaxTokens) { return 1; }
++    if (rows <= 0 || rows > kTernaryMmaKSplitMaxRows) { return 1; }
++    if ((k % kTernaryMmaChunkK) != 0) { return 1; }
++    const int chunks = k / kTernaryMmaChunkK;
++    if ((chunks % kTernaryMmaKSplitShards) != 0) { return 1; }
++    if ((chunks / kTernaryMmaKSplitShards) < kTernaryMmaKSplitMinChunksPerShard) { return 1; }
++    return kTernaryMmaKSplitShards;
++}
++
+ // ---- PTQ1_0 (type 143) staging: 24 raw base-3 bytes + 2 high bytes per 128 weights -----------
+ // The tensor core consumes the PQ2 code layout, so a PTQ1_0 chunk is staged RAW and then repacked
+ // in shared by repack_ptq1() below -- arithmetic identical to the wide-t kernel's (validated
+@@ -267,23 +462,50 @@ struct TernaryMmaLutPlane {
+ template <>
+ struct TernaryMmaLutPlane<true> {};
+ 
+-template <bool kPtq1>
++// SCHED3 CHANGE 1: the warp row dimension is a template parameter, so one build carries the 16-
++// and 32-row (and 48-row) instantiations and the launcher picks one from `n` at run time. The
++// activation plane and the ping-pong depth do not depend on it -- only the weight rows and scales.
++template <bool kPtq1, int kRowsPerWarp = kTernaryMmaRowsPerWarp>
+ struct TernaryMmaStorage : TernaryMmaLutPlane<kPtq1> {
++    static_assert(kRowsPerWarp % kTernaryMmaTileRows == 0,
++                  "the row block must be a whole number of 16-row mma tiles");
+     using Geom = TernaryMmaGeom<kPtq1>;
+     alignas(16) std::uint8_t codes[Geom::kWeightBufs][kTernaryMmaWarpsPerCta]
+-                                  [kTernaryMmaRowsPerWarp][Geom::kRowStride];
++                                  [kRowsPerWarp][Geom::kRowStride];
+     alignas(16) __nv_bfloat16 act[kTernaryMmaStages][kTernaryMmaTokens][Geom::kActStride];
+-    std::uint16_t scales[kTernaryMmaStages][kTernaryMmaWarpsPerCta][kTernaryMmaRowsPerWarp]
++    std::uint16_t scales[kTernaryMmaStages][kTernaryMmaWarpsPerCta][kRowsPerWarp]
+                         [Geom::kGroups];
+ };
+ 
++// SCHED3 CHANGE 1, ENFORCED. A `__shared__` variable of a named aggregate type is capped at 48 KB
++// (the static cap -- this path has no dynamic-shared opt-in), so the row block is not a free
++// parameter. These assert the table quoted at kTernaryMmaRowsWide, and they are what stops a future
++// edit from instantiating a footprint the compiler would reject deep inside a launch site:
++//
++//   PQ2_0  16 -> 38,144 B    32 -> 57,600 B  (over)
++//   PTQ1_0 16 -> 24,320 B    32 -> 40,192 B  (fits)
++//
++// The PQ2_0 quarter is therefore a deliberate NON-instantiation rather than an oversight; see
++// ternary_mma_rows_per_warp's `wide_allowed`, which is false for PQ2_0.
++static_assert(sizeof(TernaryMmaStorage<true, kTernaryMmaRowsNarrow>) <= 48u * 1024u,
++              "PTQ1_0 at 16 rows/warp must fit the 48 KB static shared cap");
++static_assert(sizeof(TernaryMmaStorage<true, kTernaryMmaRowsWide>) <= 48u * 1024u,
++              "PTQ1_0 at 32 rows/warp must fit the 48 KB static shared cap (it is 40,192 B)");
++static_assert(sizeof(TernaryMmaStorage<false, kTernaryMmaRowsNarrow>) <= 48u * 1024u,
++              "PQ2_0 at 16 rows/warp must fit the 48 KB static shared cap");
++// Deliberately stated as a FACT rather than asserted as a bound: the PQ2_0 wide row block is
++// 57,600 B, which is over the cap, and that is precisely why it is never instantiated.
++static_assert(sizeof(TernaryMmaStorage<false, kTernaryMmaRowsWide>) > 48u * 1024u,
++              "if PQ2_0 at 32 rows/warp ever fits, revisit the PQ2_0 clamp in "
++              "ternary_mma_rows_per_warp -- do not just delete this assert");
++
+ // kPtq1 == false: `codes` is the PQ2_0 32-code-byte-per-group base plane and `high` is unused
+ //                 (the PQ2_0 layout has no high plane, so callers pass nullptr).
+ // kPtq1 == true : `codes` is the PTQ1_0 24-byte base plane and `high` its 2-byte high plane. The
+ //                 staging cp.async's both raw planes into a weight row, the repack turns the
+ //                 24+2 bytes into the same 32-byte PQ2 code bytes the PQ2 path consumes, and every
+ //                 line below the repack is byte for byte the PQ2 path (LUT, mma, scale, stores).
+-template <bool kPtq1>
++template <bool kPtq1, int kRowsPerWarp_ = kTernaryMmaRowsPerWarp>
+ __global__ __launch_bounds__(kTernaryMmaThreads)
+ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+                                 const std::uint8_t* __restrict__ codes,
+@@ -291,19 +513,43 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+                                 const std::uint8_t* __restrict__ scales,
+                                 __nv_bfloat16* __restrict__ out, std::int32_t rows,
+                                 std::int32_t k, std::int32_t tokens,
+-                                std::int32_t out_row_stride) {
++                                std::int32_t out_row_stride,
++                                // SCHED3 CHANGE 2: the chunk range this launch owns. Shard 0 of a
++                                // split covers [0, chunks/2) and stores; shard 1 covers the rest and
++                                // ADDS into what shard 0 left (see ternary_mma_ksplit_shards). With
++                                // no split the range is the whole K and `accumulate` is false, which
++                                // is byte for byte the pre-change kernel.
++                                std::int32_t chunk_lo, std::int32_t chunk_hi,
++                                // SCHED3 CHANGE 3: false restores the serial token-tile walk in
++                                // the same binary (the A/B control arm).
++                                bool token_grid, bool accumulate) {
++    // SCHED3 CHANGE 1: this instantiation's row block, and the mma tiles it is made of.
++    constexpr int kRowsPerWarp = kRowsPerWarp_;
++    constexpr int kMTiles      = kRowsPerWarp / kTernaryMmaTileRows;
++    constexpr int kRowsPerCta  = kRowsPerWarp * kTernaryMmaWarpsPerCta;
++    // The kTernaryMmaPtq1Repack fallback is written for a warp that owns exactly 16 rows: its
++    // qs[16..24) job maps one row per PAIR of lanes (`lane >> 1`) and its qh job is a single-shot
++    // `if (lane < kRowsPerWarp)` copy. At 32 rows both would cover rows 0..15 only, leaving the
++    // upper half holding stale bytes -- silently wrong output, not a slower kernel. The NATIVE
++    // PTQ1_0 path (the one that actually runs) does not use either job, so the switch and a wide
++    // row block are simply not allowed to be on together.
++    static_assert(!(kPtq1 && kTernaryMmaPtq1Repack) || kRowsPerWarp <= kTernaryMmaTileRows,
++                  "the repack fallback only covers 16 rows per warp");
+     // STATIC shared memory, deliberately not `extern __shared__`: the footprint is a compile-time
+-    // constant (38,144 B at kPtq1 == false, 26,368 B at kPtq1 == true, both under the 48 KB per-block
+-    // static cap), and declaring an extern shared VARIABLE OF A NAMED AGGREGATE type emits a device
+-    // symbol that nvlink then cannot resolve
++    // constant of the instantiation -- 38,144 B at <PQ2_0, 16 rows>, 24,320 B at <PTQ1_0, 16 rows>
++    // and 40,192 B at <PTQ1_0, 32 rows>, all under the 48 KB per-block static cap (the exact
++    // per-instantiation budget and why <PQ2_0, 32 rows> is not built at all: see the table at
++    // kTernaryMmaRowsWide) -- and declaring an extern shared VARIABLE OF A NAMED AGGREGATE type
++    // emits a device symbol that nvlink then cannot resolve
+     // ("nvlink error : Undefined reference to 'ninfer::ops::detail::shared'"). Static also removes
+     // the need for a cudaFuncSetAttribute opt-in and for a size at every launch site.
+     //
+     // The footprint is what decides occupancy on this kernel, and that is why the PTQ1_0
+-    // instantiation is the SMALLER of the two here: 38,144 B is two CTAs per SM, 26,368 B is three
+-    // (see kTernaryMmaPtq1ChunkK).
++    // instantiation is the SMALLER of the two here: 38,144 B is two CTAs per SM, 24,320 B is four
++    // (see kTernaryMmaPtq1ChunkK). The 32-row PTQ1_0 instantiation trades that back for the wider
++    // row block: 40,192 B is two CTAs per SM, which is the cost side of SCHED3 CHANGE 1.
+     using Geom = TernaryMmaGeom<kPtq1>;
+-    __shared__ TernaryMmaStorage<kPtq1> staging;
++    __shared__ TernaryMmaStorage<kPtq1, kRowsPerWarp> staging;
+     // NOTE: no `lut` alias here -- the table lives in an empty base for kPtq1 (see
+     // TernaryMmaLutPlane), so only the PQ2_0 branch may name it, and it names it there.
+     auto& codes_sh = staging.codes;
+@@ -336,7 +582,7 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+         }
+     }
+ 
+-    const int row0 = static_cast<int>(blockIdx.x) * kTernaryMmaRowsPerCta;
++    const int row0 = static_cast<int>(blockIdx.x) * kRowsPerCta;
+     if (row0 >= rows) { return; }
+ 
+     constexpr int kCodeBytes =
+@@ -349,10 +595,12 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+         static_cast<std::int64_t>(groups_per_row) * kHighBytes;
+     const std::int64_t scale_row_bytes =
+         static_cast<std::int64_t>(groups_per_row) * PQ2RowSplitStorage::kScaleBytesPerGroup;
+-    const std::int32_t chunks = k / Geom::kChunkK;
++    // Chunks per row. The kernel itself now walks the [chunk_lo, chunk_hi) range it is launched
++    // with (SCHED3 CHANGE 2), so this is only kept for the shape arithmetic below.
++    [[maybe_unused]] const std::int32_t chunks = k / Geom::kChunkK;
+ 
+     const std::int64_t warp_row_base =
+-        static_cast<std::int64_t>(row0) + static_cast<std::int64_t>(warp) * kTernaryMmaRowsPerWarp;
++        static_cast<std::int64_t>(row0) + static_cast<std::int64_t>(warp) * kRowsPerWarp;
+ 
+     // Stage one chunk: this warp's 16x64 code window, its scales, and (cooperatively) the
+     // CTA-wide activation tile. Out-of-range rows are zero-filled rather than read, so a partial
+@@ -387,7 +635,7 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+             // sector a warp touches is covered by whole copies even at 8-byte granularity.
+             constexpr int kQsCopies     = Geom::kGroups *
+                                           (PTQ1RowSplitStorage::kCodeBytesPerGroup / 8);
+-            constexpr int kQsCopiesWarp = kTernaryMmaRowsPerWarp * kQsCopies;
++            constexpr int kQsCopiesWarp = kRowsPerWarp * kQsCopies;
+             const std::int64_t qs_chunk_byte =
+                 static_cast<std::int64_t>(chunk) * Geom::kGroups *
+                 PTQ1RowSplitStorage::kCodeBytesPerGroup;
+@@ -414,7 +662,7 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+             // next row's start.
+             static_assert(Geom::kQhBytes == 4 || Geom::kQhBytes == 8,
+                           "the qh copy below is one cp.async of the chunk's high bytes");
+-            if (lane < kTernaryMmaRowsPerWarp) {
++            if (lane < kRowsPerWarp) {
+                 const std::int64_t global_row = warp_row_base + lane;
+                 const bool valid              = global_row < rows;
+                 cp_async_zfill<Geom::kQhBytes, Cache::ca>(
+@@ -430,7 +678,7 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+         // chunk width silently stages only PART of each row at another width, which presents as a
+         // suspiciously fast kernel that produces garbage (all four correctness checks went to NaN).
+         constexpr int kCopiesPerRow  = Geom::kCodesPerRow / 16;
+-        constexpr int kCopiesPerWarp = kTernaryMmaRowsPerWarp * kCopiesPerRow;
++        constexpr int kCopiesPerWarp = kRowsPerWarp * kCopiesPerRow;
+ #pragma unroll
+         for (int copy = lane; copy < kCopiesPerWarp; copy += 32) {
+             const int local_row           = copy / kCopiesPerRow;
+@@ -447,7 +695,7 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+         }
+ 
+         { // scales: one entry per (row, group-in-chunk) -- 16 x 4 at a 512-wide chunk
+-            constexpr int kScaleEntries = kTernaryMmaRowsPerWarp * Geom::kGroups;
++            constexpr int kScaleEntries = kRowsPerWarp * Geom::kGroups;
+ #pragma unroll
+             for (int entry = lane; entry < kScaleEntries; entry += 32) {
+                 const int local_row           = entry / Geom::kGroups;
+@@ -558,7 +806,7 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+ 
+                 // qs[0..16): four 4-byte source words per row -> 64 jobs, two per lane, slot == lane&3
+ #pragma unroll
+-                for (int job = lane; job < kTernaryMmaRowsPerWarp * 4; job += 32) {
++                for (int job = lane; job < kRowsPerWarp * 4; job += 32) {
+                     const int local_row = job >> 2;
+                     const int slot      = job & 3;
+                     const unsigned g4 =
+@@ -575,8 +823,8 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+                     emit_stages(&codes_sh[dst_buf][warp][local_row][cd_base + 20 + par], 2, g4);
+                 }
+ 
+-                // qh: 16 rows, one lane per row
+-                if (lane < kTernaryMmaRowsPerWarp) {
++                // qh: rows, one lane per row
++                if (lane < kRowsPerWarp) {
+                     const std::uint8_t* src_row = &codes_sh[src_buf][warp][lane][0];
+                     const std::uint8_t h0       = src_row[Geom::kQhOffset + 2 * group];
+                     const std::uint8_t h1       = src_row[Geom::kQhOffset + 2 * group + 1];
+@@ -597,8 +845,16 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+     // -- the same factor the reference kernel gets from its 8-token tile, but through a kernel that
+     // sustains ~400 GiB/s instead of ~60 GiB/s. Above 8 tokens this replaces a fallback that cost
+     // prefill a factor of ~8 against the non-ternary engine.
+-    const int row_lo = row0 + warp * kTernaryMmaRowsPerWarp + gid;
+-    const int row_hi = row_lo + 8;
++    //
++    // SCHED3 CHANGE 3: which tile (or tiles) this CTA walks. With the token axis in grid.y this CTA
++    // does EXACTLY ONE tile -- blockIdx.y selects it -- and the loop below is one iteration; with
++    // NINFER_TERNARY_TOKEN_GRID=0 it walks every tile serially, which is the pre-change behaviour
++    // and the A/B control arm. The tile body is identical either way, which is the whole
++    // bit-exactness argument (see the change-3 note at the top of this file).
++    const int tok_tiles = token_grid ? kTernaryMmaTokenTilesPerCta
++                                     : ((tokens + kTernaryMmaTokens - 1) / kTernaryMmaTokens);
++    const int tok_base0 = token_grid ? static_cast<int>(blockIdx.y) * kTernaryMmaTokens : 0;
++    if (tok_base0 >= tokens) { return; }
+ 
+     // ---- SWEEP VARIANT A (2026-09-23): hoisted base-3 stage multiplier for the qh bytes --------
+     // Step 7 of every group decodes the qh pair at stage `lid`, and `lid = lane & 3` is 0..3, so the
+@@ -617,16 +873,26 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+         }
+     }
+ 
+-    for (int tok_base = 0; tok_base < tokens; tok_base += kTernaryMmaTokens) {
+-        float acc0 = 0.0f;
+-        float acc1 = 0.0f;
+-        float acc2 = 0.0f;
+-        float acc3 = 0.0f;
++    for (int tok_tile = 0; tok_tile < tok_tiles; ++tok_tile) {
++        const int tok_base = tok_base0 + tok_tile * kTernaryMmaTokens;
+ 
+-        stage(0, 0, tok_base);
++        // SCHED3 CHANGE 1: one accumulator QUAD per 16-row mma tile this warp owns (1 at 16 rows
++        // per warp, 2 at 32, 3 at 48). The k chain below is per tile and unchanged; only how many
++        // independent chains a warp carries is new.
++        float acc[kMTiles][4];
++#pragma unroll
++        for (int t = 0; t < kMTiles; ++t) {
++#pragma unroll
++            for (int i = 0; i < 4; ++i) { acc[t][i] = 0.0f; }
++        }
++
++        // SCHED3 CHANGE 2: the prologue stages THIS launch's first chunk (chunk_lo), not chunk 0 --
++        // and into the ping-pong slot that `chunk_lo & 1` names, so the loop's `buf = chunk & 1`
++        // stays the correct alternation for a shard that does not start at an even chunk.
++        stage(chunk_lo & 1, chunk_lo, tok_base);
+         cp_commit();
+ 
+-        for (int chunk = 0; chunk < chunks; ++chunk) {
++        for (int chunk = chunk_lo; chunk < chunk_hi; ++chunk) {
+             const int buf = chunk & 1;
+             // The weight-row buffer the MMA reads this iteration. PQ2_0: the ping-pong slot staged
+             // one iteration ago. PTQ1_0: the buffer the repack below is about to write, i.e. the
+@@ -636,7 +902,7 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+             // chunk is what the mma reads and `wbuf` has no consumer there.
+             [[maybe_unused]] const int wbuf = kPtq1 ? ((chunk + 2) % Geom::kWeightBufs) : buf;
+ 
+-            if (chunk + 1 < chunks) {
++            if (chunk + 1 < chunk_hi) {
+                 stage(buf ^ 1, chunk + 1, tok_base);
+                 cp_commit();
+                 cp_wait<1>(); // chunk `buf` has landed; chunk+1 may still be in flight
+@@ -659,11 +925,20 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+ #pragma unroll 1
+         for (int group_in_chunk = 0; group_in_chunk < Geom::kGroups;
+              ++group_in_chunk) {
+-            float g0 = 0.0f;
+-            float g1 = 0.0f;
+-            float g2 = 0.0f;
+-            float g3 = 0.0f;
++            float g[kMTiles][4];
++#pragma unroll
++            for (int t = 0; t < kMTiles; ++t) {
++#pragma unroll
++                for (int i = 0; i < 4; ++i) { g[t][i] = 0.0f; }
++            }
+ 
++            // SCHED3 CHANGE 1: one 16-row mma tile per iteration of this loop, and nothing else
++            // changes -- the k-step sequence, the operand production and the group's single scale
++            // fold are the same code, run once per tile instead of once per warp.
++            // `row_gid` is the tile's first mma row and `row_gid + 8` its second row group.
++#pragma unroll
++            for (int t = 0; t < kMTiles; ++t) {
++            const int row_gid = gid + kTernaryMmaTileRows * t;
+             if constexpr (kPtq1) {
+                 // ---- NATIVE PTQ1_0 OPERAND PRODUCTION ------------------------------------------
+                 // The raw 24+2-byte row is decoded STRAIGHT into the A fragment: no repack into
+@@ -705,7 +980,7 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+                 unsigned vQ[2];
+ #pragma unroll
+                 for (int r = 0; r < 2; ++r) {
+-                    const std::uint8_t* row = &codes_sh[rbuf][warp][gid + 8 * r][0];
++                    const std::uint8_t* row = &codes_sh[rbuf][warp][row_gid + 8 * r][0];
+                     vA[r] = __byte_perm(load_vec<unsigned>(row + qs_base + 4 * half), 0u, pair_sel);
+                     vB[r] =
+                         __byte_perm(load_vec<unsigned>(row + qs_base + 8 + 4 * half), 0u, pair_sel);
+@@ -741,11 +1016,11 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+                             const unsigned lo  = __byte_perm(kTritPairLo, kTritPairHi, sel);
+                             const unsigned hi  = __byte_perm(kTritPairLo, kTritPairHi, sel >> 16);
+                             if (r == 0) {
+-                                a0 = lo;
+-                                a2 = hi;
++                                g[t][0] = lo;
++                                g[t][2] = hi;
+                             } else {
+-                                a1 = lo;
+-                                a3 = hi;
++                                g[t][1] = lo;
++                                g[t][3] = hi;
+                             }
+                         }
+                     } else if (step < 7) {
+@@ -764,11 +1039,11 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+                             const unsigned lo  = __byte_perm(kTritPairLo, kTritPairHi, sel);
+                             const unsigned hi  = __byte_perm(kTritPairLo, kTritPairHi, sel >> 16);
+                             if (r == 0) {
+-                                a0 = lo;
+-                                a2 = hi;
++                                g[t][0] = lo;
++                                g[t][2] = hi;
+                             } else {
+-                                a1 = lo;
+-                                a3 = hi;
++                                g[t][1] = lo;
++                                g[t][3] = hi;
+                             }
+                         }
+                     } else {
+@@ -787,11 +1062,11 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+                             const unsigned lo  = __byte_perm(kTritPairLo, kTritPairHi, sel);
+                             const unsigned hi  = __byte_perm(kTritPairLo, kTritPairHi, sel >> 16);
+                             if (r == 0) {
+-                                a0 = lo;
+-                                a2 = hi;
++                                g[t][0] = lo;
++                                g[t][2] = hi;
+                             } else {
+-                                a1 = lo;
+-                                a3 = hi;
++                                g[t][1] = lo;
++                                g[t][3] = hi;
+                             }
+                         }
+                     }
+@@ -804,7 +1079,7 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+                                 smem_addr(&act_sh[buf][lane & 7]
+                                                 [kstep * 16 + ((lane >> 3) & 1) * 8]));
+ 
+-                    mma_bf16(g0, g1, g2, g3, a0, a1, a2, a3, bf0, bf1);
++                    mma_bf16(g[t][0], g[t][1], g[t][2], g[t][3], a0, a1, a2, a3, bf0, bf1);
+                 }
+             } else {
+             // The PQ2_0 decode table lives in the (non-empty, for this instantiation) base
+@@ -816,11 +1091,11 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+                 const int kstep    = group_in_chunk * 8 + step;
+                 const int word_off = kstep * 4; // one k-step of 16 codes == one 4-byte word
+ 
+-                // A operand: rows gid and gid+8, each contributing k and k+8 pairs.
++                // A operand: rows row_gid and row_gid+8, each contributing k and k+8 pairs.
+                 const unsigned word_lo =
+-                    load_vec<unsigned>(&codes_sh[wbuf][warp][gid][word_off]);
++                    load_vec<unsigned>(&codes_sh[wbuf][warp][row_gid][word_off]);
+                 const unsigned word_hi =
+-                    load_vec<unsigned>(&codes_sh[wbuf][warp][gid + 8][word_off]);
++                    load_vec<unsigned>(&codes_sh[wbuf][warp][row_gid + 8][word_off]);
+                 const unsigned shift_near = 8u * static_cast<unsigned>(lid >> 1);
+                 const unsigned shift_far  = 8u * static_cast<unsigned>((lid >> 1) + 2);
+ 
+@@ -844,46 +1119,67 @@ void ternary_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+                             smem_addr(&act_sh[buf][lane & 7]
+                                             [kstep * 16 + ((lane >> 3) & 1) * 8]));
+ 
+-                mma_bf16(g0, g1, g2, g3, a0, a1, a2, a3, bf0, bf1);
++                mma_bf16(g[t][0], g[t][1], g[t][2], g[t][3], a0, a1, a2, a3, bf0, bf1);
+             }
+             }
+ 
+-            // One PQ2_0 group spans eight k-steps, so its scale is applied once, per row.
+-            const float top = __half2float(
+-                __ushort_as_half(scale_sh[buf][warp][gid][group_in_chunk]));
+-            const float bottom = __half2float(
+-                __ushort_as_half(scale_sh[buf][warp][gid + 8][group_in_chunk]));
+-            acc0 = fmaf(g0, top, acc0);
+-            acc1 = fmaf(g1, top, acc1);
+-            acc2 = fmaf(g2, bottom, acc2);
+-            acc3 = fmaf(g3, bottom, acc3);
++            // SCHED3 CHANGE 1: the group's single scale fold, now once per mma tile. Each tile's
++            // chain is folded in the same order and with the same values as when the tile was the
++            // whole warp, so the elements are unchanged.
++#pragma unroll
++            for (int t = 0; t < kMTiles; ++t) {
++                const int row_gid = gid + kTernaryMmaTileRows * t;
++                // One PQ2_0 group spans eight k-steps, so its scale is applied once, per row.
++                const float top = __half2float(
++                    __ushort_as_half(scale_sh[buf][warp][row_gid][group_in_chunk]));
++                const float bottom = __half2float(
++                    __ushort_as_half(scale_sh[buf][warp][row_gid + 8][group_in_chunk]));
++                acc[t][0] = fmaf(g[t][0], top, acc[t][0]);
++                acc[t][1] = fmaf(g[t][1], top, acc[t][1]);
++                acc[t][2] = fmaf(g[t][2], bottom, acc[t][2]);
++                acc[t][3] = fmaf(g[t][3], bottom, acc[t][3]);
++            }
++            } // end of the m-tile loop (SCHED3 CHANGE 1)
+         }
+ 
+             __syncthreads(); // the next stage reuses this buffer
+         }
+ 
+-        // C fragment: c0/c1 are rows gid, columns 2*lid / 2*lid+1; c2/c3 are rows gid+8.
++        // C fragment: c0/c1 are rows row_gid, columns 2*lid / 2*lid+1; c2/c3 are rows row_gid+8.
++        // SCHED3 CHANGE 1: one store block per mma tile, in the same row order as before.
++        // SCHED3 CHANGE 2: `accumulate` folds this shard's partial on top of what an earlier shard
++        // already wrote -- the ONE place in this file where the result is not bit-identical to the
++        // unsplit kernel, because it costs an extra bf16 round per element (see the gate note).
+         const int token_a = tok_base + 2 * lid;
+         const int token_b = token_a + 1;
++        const auto store_one = [&](__nv_bfloat16* dst, float value) {
++            *dst = accumulate ? __float2bfloat16_rn(__bfloat162float(*dst) + value)
++                              : __float2bfloat16_rn(value);
++        };
+ 
+-        if (row_lo < rows) {
+-            if (token_a < tokens) {
+-                out[static_cast<std::int64_t>(token_a) * out_row_stride + row_lo] =
+-                    __float2bfloat16_rn(acc0);
+-            }
+-            if (token_b < tokens) {
+-                out[static_cast<std::int64_t>(token_b) * out_row_stride + row_lo] =
+-                    __float2bfloat16_rn(acc1);
+-            }
+-        }
+-        if (row_hi < rows) {
+-            if (token_a < tokens) {
+-                out[static_cast<std::int64_t>(token_a) * out_row_stride + row_hi] =
+-                    __float2bfloat16_rn(acc2);
++#pragma unroll
++        for (int t = 0; t < kMTiles; ++t) {
++            const int row_lo = row0 + warp * kRowsPerWarp + kTernaryMmaTileRows * t + gid;
++            const int row_hi = row_lo + 8;
++            if (row_lo < rows) {
++                if (token_a < tokens) {
++                    store_one(&out[static_cast<std::int64_t>(token_a) * out_row_stride + row_lo],
++                              acc[t][0]);
++                }
++                if (token_b < tokens) {
++                    store_one(&out[static_cast<std::int64_t>(token_b) * out_row_stride + row_lo],
++                              acc[t][1]);
++                }
+             }
+-            if (token_b < tokens) {
+-                out[static_cast<std::int64_t>(token_b) * out_row_stride + row_hi] =
+-                    __float2bfloat16_rn(acc3);
++            if (row_hi < rows) {
++                if (token_a < tokens) {
++                    store_one(&out[static_cast<std::int64_t>(token_a) * out_row_stride + row_hi],
++                              acc[t][2]);
++                }
++                if (token_b < tokens) {
++                    store_one(&out[static_cast<std::int64_t>(token_b) * out_row_stride + row_hi],
++                              acc[t][3]);
++                }
+             }
+         }
+     }
+

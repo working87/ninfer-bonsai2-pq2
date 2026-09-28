@@ -1,0 +1,6 @@
+# large binaries: downloaded by scripts\deploy.ps1 from ModelScope
+model/*.ninfer
+engine/*.exe
+engine/*.dll
+src-tree/ninfer-4090w-ternary/ffmpeg/bin/*.dll
+*.part

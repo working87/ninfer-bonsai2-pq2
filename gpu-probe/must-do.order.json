@@ -1,0 +1,66 @@
+{
+  "note": "Must-do ORDER: sorted by (result size x time cost). Tier 0 = do first. Within a tier, shortest first. This is what MUST-DO.md sorts by and what `must-do` prints.",
+  "tiers": {
+    "0": "0 成本、最先做 —— 口径与纪律（不做就得到假读数）",
+    "1": "一条命令、收益最大 —— 投机后端 / KV 档 / K / 上下文",
+    "2": "0 成本、避免掉分 —— 权重选择",
+    "3": "env 可扫、分钟级 —— 两个阈值",
+    "4": "一次编译吃三个收益 —— 调度桶 + A 类代码 + SM 常量（合并成同一档，一起编一起验）",
+    "5": "要改内核代码 —— 未实现 / 未开工",
+    "6": "暂存，不做 —— 研究方向"
+  },
+  "cost_label": {
+    "0-cost": "0 成本（读文档/设参数即可）",
+    "minutes": "分钟级（同一二进制 env 扫）",
+    "one-build": "一次编译 ~35 min（编一次验三件）",
+    "needs-code": "需改码（内核改动，尚未开工）"
+  },
+  "items": [
+    { "id": "C1", "order": 1,  "tier": 0, "cost": "0-cost" },
+    { "id": "C5", "order": 2,  "tier": 0, "cost": "0-cost" },
+    { "id": "C3", "order": 3,  "tier": 0, "cost": "0-cost" },
+    { "id": "C4", "order": 4,  "tier": 0, "cost": "0-cost" },
+    { "id": "C2", "order": 5,  "tier": 0, "cost": "0-cost" },
+
+    { "id": "B4", "order": 10, "tier": 1, "cost": "0-cost" },
+    { "id": "B3", "order": 11, "tier": 1, "cost": "0-cost" },
+
+    { "id": "B5", "order": 20, "tier": 2, "cost": "0-cost" },
+
+    { "id": "B1", "order": 30, "tier": 3, "cost": "minutes" },
+    { "id": "B2", "order": 31, "tier": 3, "cost": "minutes" },
+
+    { "id": "F1", "order": 40, "tier": 4, "cost": "one-build" },
+    { "id": "E1", "order": 41, "tier": 4, "cost": "one-build" },
+    { "id": "B2b", "order": 42, "tier": 4, "cost": "one-build" },
+
+    { "id": "E2", "order": 50, "tier": 5, "cost": "needs-code" },
+    { "id": "A2", "order": 51, "tier": 5, "cost": "needs-code" },
+
+    { "id": "A1", "order": 60, "tier": 6, "cost": "needs-code" },
+    { "id": "A3", "order": 61, "tier": 6, "cost": "needs-code" },
+    { "id": "D1", "order": 90, "tier": 6, "cost": "0-cost" },
+    { "id": "D2", "order": 91, "tier": 6, "cost": "0-cost" },
+    { "id": "D3", "order": 92, "tier": 6, "cost": "0-cost" },
+    { "id": "D4", "order": 93, "tier": 6, "cost": "0-cost" },
+    { "id": "D5", "order": 94, "tier": 6, "cost": "0-cost" },
+    { "id": "D6", "order": 95, "tier": 6, "cost": "0-cost" },
+    { "id": "D7", "order": 96, "tier": 6, "cost": "0-cost" }
+  ],
+  "class_note": "A1/A2/A3 的【实现】由 F1 指向的 sched3-patch 提供（见各档 sched3-patch\\README-怎么用.md）；它们的【值】由 F1 要求在你自己的卡上重扫。所以 A1/A3 排在 F1 之后（代码已随包，但值要自己扫），A2 因为非逐位相同排在第 5 层（要先过数值门）。",
+  "tier6_note": "第 6 层含两类：① A1/A3 的【代码是否并入】：实现已在 sched3-patch 里，但**值必须自己扫**（F1）⇒ 不做 F1 就没有理由动它们；② D 类 = 已证伪，**别做**（列出来只是让你别重复踩）。",
+  "item_how_prefix": {
+    "0-cost": "【耗时量级】0 成本（读文档 / 设参数即可，不用编、不用等）",
+    "minutes": "【耗时量级】分钟级（同一二进制切 env，A/B/A/B 各 3 次）",
+    "one-build": "【耗时量级】一次编译 ~35 min（F1 + E1 + B2b 在同一个引擎里一起编、一起验）",
+    "needs-code": "【耗时量级】需改码（内核改动，尚未开工；先读判据再动手）"
+  },
+  "moe_staging": {
+    "id": "G-MOE",
+    "title": "稀疏化 / MoE 化（暂存，不做）",
+    "tier": 6,
+    "order": 99,
+    "doc": "(内部研究方向，不随包分发)",
+    "note": "研究方向，未立项。列在这里只是让它别丢，不是待办。"
+  }
+}

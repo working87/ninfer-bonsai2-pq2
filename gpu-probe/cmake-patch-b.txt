@@ -1,0 +1,8 @@
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "89")
+  add_compile_definitions(NINFER_SM89=1)
+elseif(CMAKE_CUDA_ARCHITECTURES MATCHES "^(120a|120)$")
+  # NOTE: this package tree carries the upstream 89/86 kernel set. Configuring for 120a works
+  # and yields the right SM constant, but the NVFP4 / k8v4 sm_120 kernels are NOT in this tree.
+  # For a real 50-series engine use the buildkit / gpu-samples tree.
+  add_compile_definitions(NINFER_SM120=1)
+endif()

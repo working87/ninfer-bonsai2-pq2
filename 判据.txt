@@ -1,0 +1,126 @@
+极速档 PQ2 —— 就绪判据 / 期望读数 / 常见故障
+============================================================
+
+【一、起服务】按显存挑一个双击：
+  start-8084.bat          端口 8084  基础制品 262144/fp8 + MTP3   （>=16 GB）
+  start-8087-12g.bat      端口 8087  基础制品 131072/rk4v4 + MTP3 （12~16 GB，12G 卡用这个）
+  start-8085-dflash2.bat  端口 8085  -dflash2 制品 32768/fp8 + DFlash2 K=7（>=16 GB）
+  start-8086.bat          端口 8086  基础制品 262144/fp8 + 视觉（>=16 GB）
+  ⚠ 投机解码自 2026-09-26 起默认开启（--spec mtp --draft-tokens 3）。
+
+【二、就绪判据】三条全中才算起来了
+  1) 窗口里出现这一行：
+       listening on http://127.0.0.1:8084
+  2) 另开一个窗口：
+       curl.exe -s -o NUL -w "%{http_code}" http://127.0.0.1:8084/v1/models
+     期望：200
+  3) 启动日志里的容量行（本机实测原文）：
+       capacity | KV 262,144 tokens, fp8, explicit | pages 4,096/4,096 | runtime 8.54 GiB | free 15.4 GiB
+
+【三、从冷启动到 200 的耗时】
+  本机实测：约 4~6 秒（权重 6.70 GiB，读盘 1.3s；含 CUDA Graph 准备）
+
+【四、第一次发请求的注意点】★ ninfer 与 llama.cpp 不同
+  请求体必须带 "model" 字段，例如：
+    {"model":"qwen3.8-27b","messages":[{"role":"user","content":"你好"}],"max_tokens":64}
+  少了 model 字段会被拒。
+
+【五、本机实测读数（口径必须一起看）】
+  机器：RTX 4080 SUPER 32,760 MiB / 单路（--max-concurrency 1）
+  引擎：engine\ninfer-serve.exe  sha256 566F0D0E...BACB8  264,173,568 B
+  模型：model\bonsai2_27b_ternary_v2.ninfer  sha256 05BBBF01...D76C  7.74 GB
+  ─ prefill：4,070-token 提示、max_tokens=8、每次换随机 nonce 强制冷缓存
+            实测 2,230 t/s（TTFT 1.9 s；日志 cache 0 (0.0%) 确认冷）
+  ─ decode ：ctx 16384、贪心、400 token、1 warmup + 3 跑取中位
+            实测 226.0 t/s（本轮接受率 81.75%，即 5.48 tok/round）
+  ─ DFlash2 档（start-8085）实测：数数字 600 token 353.8 t/s（接受 97.9%）／HTML 193.9／散文 112.1
+  ─ 12G 配方（start-8087，131072/rk4v4）实测：权重 7.12 GiB、KV runtime 2.81 GiB、
+            全卡 11,464 MiB、decode 188 t/s（接受 98.5%）
+  ⚠ 跨卡数字不可比；本包只保证"同卡同模型同参数"下量级一致。
+  ⚠ 接受率必须和 t/s 一起看：同一台机器上"数数字"97.9%，"散文"只有 21~28%。
+
+【六、常见故障 → 处理】
+  1) 双击后窗口一闪就没 / 退出码 0xC0000135
+     ⇒ CUDA 运行库不在 PATH。改 start-8084.bat 里的 CUDA_BIN。
+  2) 报 unknown argument: --disk-cache
+     ⇒ 本引擎（v1.0.8 dev fork 线）没有这个参数，别加。（这是与生产引擎的差异之一）
+  3) 报 [json.exception.type_error.316] invalid UTF-8 byte ...
+     ⇒ 路径里有中文。本引擎路径必须纯 ASCII，请把整个包挪到纯英文路径下。
+  4) 报 --kv-capacity must be >= --max-context / 类似容量硬检查
+     ⇒ 引擎硬要求 kv-capacity ≥ max-context，本包已给成相等，别单独调小一个。
+  5) 端口被占用
+     ⇒ 换 --port；注意杀进程要用端口反查（见下），按进程名杀可能杀不到。
+        $p = (Get-NetTCPConnection -LocalPort 8084 -State Listen).OwningProcess
+        Stop-Process -Id $p -Force
+  6) 客户端脚本崩了但引擎不退
+     ⇒ 正常现象：驱动脚本被杀后引擎会变成孤儿进程，端口和显存都还占着。
+        必须按上面第 5 条按端口杀。
+  7) 想加并发
+     ⇒ 12G/16G 上别加。实测每加一路单路速度掉约 28%（1路 113.3 → 2路 79.3 → 3路 57.6 t/s），
+        且 KV 池按并发线性放大（16 GB 上"N>1"与">64k 上下文"互斥）。本档定位=交互延迟优先，固定单路。
+        引擎上限是 8 路；要吞吐场景时 2 路是拐点（总吞吐 +68~93%、单路几乎不掉）。
+  8) DFlash2 档启动即死：FATAL ... | linear_topk: unsupported head profile
+     ⇒ 忘了 --lm-head-draft。本制品的 text/output_head 是 PQ2（三元），融合 top-k 内核只认
+        W8/FP8 @248320 行 与 Q4 @131072 行 ⇒ 必须走包内 131072 行的 Q4 草稿头。
+        start-8085-dflash2.bat 已经带了；自己手敲命令时别漏。
+  9) 12G 卡双击 start-8084 起不来（报 after weights 只剩多少字节）
+     ⇒ 那是 262144+fp8 的物理硬顶，不是配置错。改用 start-8087-12g.bat（rk4v4/131072）。
+  10) DFlash2 档在 12G 卡上起不来
+     ⇒ DFlash2 模式权重就 9.10 GiB，12G 卡容不下（本包没给 12G 的 DFlash2 启动件）；
+        要么用 16 GB+ 的卡，要么退回 start-8087-12g.bat（MTP3）。
+  11) ★ 双击后"卡住"：单核 CPU 满载、GPU 几乎闲置（不报错，像死机）
+     ⇒ **第一件事查【引擎架构】与卡是否匹配**：
+         nvidia-smi --query-gpu=compute_cap --format=csv
+         8.9（40 系）→ engine\ninfer-serve.exe      （sha 566F0D0E...）
+         12.0（50 系）→ engine\ninfer-serve-sm120.exe（sha FE170EB2...）
+       本包五个启动件（8084 / 8085-dflash2 / 8086 / 8087-12g / 8088-dflash2-128k）会自动选；**自己手敲命令时最容易拿错**。
+       两份引擎都**不含对方架构的 PTX** ⇒ 拿错不是"慢一点"，而是**没有可用内核镜像**（表现为卡死）。
+  12) ★ KV 精度也分架构（引擎里是硬门，不是偏好）—— 实测原文：
+        FATAL server failed during startup | kv-dtype 'rk4v4' requires compute capability 8.9
+      · rk4v4 / rk4v4-e8  → **只有 40 系（8.9）**
+      · k8v4 / nvfp4      → **只有 50 系（12.0）**
+      · bf16 / int8 / fp8 → 两代都能用
+      ⇒ 同一个"12G 配方"在两代卡上要写**不同的 KV 档**：start-8087-12g.bat 会自动选
+        （8.9→rk4v4 / 12.0→nvfp4，两者都是 17~18 KiB/token，128K 装得下 12 GB）。
+  13) 本引擎（**指本包 engine\ 里这两份二进制**）运行时只接受 cc 8.9 与 12.0
+      （源码 `layouts_impl.hpp` 的 `validate_target_options` 里一条硬门：
+       "Qwen3.6 family runtime requires compute capability 12.0 or 8.9"；
+       这两句字符串在 40/50 两份 exe 里都能查到）。
+      ⇒ 30 系（8.6）/ A100（8.0）/ H100（9.0）用**本包这两份**会被这条门直接拒掉。
+      ⚠️ **限定**：这是**我们这份构建**的性质，**不是"这份代码不支持"** ——
+        **"我们没编" ≠ "你部署不了"**：源码树就在包里，改三处（架构总门 `layouts_impl.h:742`、
+        KV 档门 `:668`、构建开关 `-DNINFER_CUDA_ARCH/_SM_COUNT/_TIER`）就能为你的架构编一份；
+        各架构的内核限制（30 系没有 FP8、nvfp4 要 sm_100+…）、改完的三步验收，
+        全部写在 `docs\引擎-模型-参数对照表.md` §6 与 `docs\兜底方案-从源码自己编译.md` 末尾那节。
+        别人的分支/别人编的引擎同样可能放宽了这条门 ⇒ 以你自己那份二进制为准。
+      ★ 判据不要靠推断：跑一次 `自检-引擎与卡匹配.ps1`（本包根目录），
+        它会打印你的 cc、每个 exe 里有没有这两条门字符串、以及各 exe 的 cubin/PTX 架构
+        （有 cuobjdump 时）。**任何一份别人的引擎，扔进 engine\ 再跑一次本脚本就能判它支不支持。**
+  14) ★★ 多轮/同前缀第二次请求报 500，紧接着全端口变 503（**单发一次测不出来**）
+      ⇒ 前缀复用崩溃。判据指纹：
+           500 的 message = "candidate token ledger does not match prompt length"
+           stderr         = "serve-fail: candidate token ledger does not match prompt length"
+           日志里第三个请求有 "cache … (99.5%, shared prefix)"（证明复用真的走了）
+         三步自查（新前缀 / 同一前缀 / 同前缀+后缀 ⇒ 期望 200/200/200）、
+         修复方式（自编译用包内 src-tree；临时规避 `--no-prefix-reuse`）、
+         以及我们的三臂实测表（出厂 200/200/200、负控 200/500/503），
+         全部写在 `docs\复现手册-排错篇.md` 末尾那节「附 ★★ 前缀复用崩溃」。
+
+【七、这个包跑不了什么（边界，别过度承诺）】
+  · 只保证"短提示 + 常规对话"的读数。本档 prefill 仍是**有界可见集**路线，
+    不是 KVMem 超长上下文那条路；要读 1M 级语料请走成品 P001（llama+KVMem 线）。
+  · 未验证：多卡、非 40 系卡、Windows 之外的系统；DFlash2 档在 12 GB 卡上未验。
+  · **投机输出与"不开投机"不逐字相同**（高置信任务一致、开放任务早分叉）⇒ 只声明"速度 ×N"，
+    不声明"文本无损"。机制（贪心近并列的数值翻转 vs 验证规则有损）我们**未定性**。
+  · `--draft-tokens`：引擎允许 1..15（dflash/dflash2）/1..5（mtp），但 **K=8 起单轮成本跳 3 倍** ⇒ 工程上用 5/7；`rk4v4` 是容量档不是速度档；`--wddm-evictable-budget` 别加。
+  · 本包不含视觉塔以外的任何外部依赖下载，全部离线可跑。
+
+【八、还想再快？有一条"自改"的路（老卡优先）】
+  · 三元线性层的 **int8 档起点阈值**（kTernaryS8MinTokens，默认 33）**不是普适最优，是卡的属性**：
+    我们卡上交叉点在 T≈32~40；一张 66 SM 的 Ada 卡上实测在 T≈17。
+  · 老卡 / 中低端卡（原生 int8 张量核但 SM 少）把它调低通常有收益；大卡往往保持 33。
+  · 要动它必须**自己重编一次引擎**（源码树与编译 SOP 都在包内）——
+    精确 diff、探针验法（先证"档真的换了"）、三层判据（结构/时间/数值）、回退开关，全在
+    docs\调参-按卡重拟合int8档起点-自改配方.md
+  · ⚠️ 两条最容易翻车的：① 策略阈值必须与"缓冲分配阈值"拆开，否则**静默落回慢档**（读数等于基线）；
+    ② 标准 PPL 口径（--context 512）**不覆盖** T=9..31，改这段必须另跑 --context 32 --stride 16。

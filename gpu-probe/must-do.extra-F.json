@@ -1,0 +1,18 @@
+[
+    {
+      "id": "F1",
+      "title": "调度桶按卡重扫（A 类三条的【值】）—— 同一二进制就能扫，不用重编",
+      "class": "F",
+      "applies_to": "both",
+      "rebuild_required": false,
+      "evidence_level": "measured",
+      "evidence_source": "我们卡（RTX 4080 SUPER，实测 SM=80）的中间实测；其它卡一律 hypothesis，必须自己扫。数字为【中间值/待最终判定】，见 evidence 字段",
+      "why": "A 类三条（A1 行块分桶 / A2 K 分片门 / A3 token 进 grid.y）的**实现**与卡无关，但**桶的边界、行数与门阈值是卡的函数**（每 SM 可用带宽 + 占用率 + SM 数）。同一份代码在 4080 SUPER（80 SM）上量到的值，搬到别的卡就是猜。⇒ 代码通用、**值不通用**，所以值必须在你自己卡上重扫。",
+      "how": "候选件带三个 env，**同一二进制就能扫，不动代码也不用重编**：① `NINFER_TERNARY_SMALL_T_ROWS=auto|16|32`（A1，auto = n 分桶：n<=5120 走 16 行、n>5120 走 32 行；有余量再挪分桶边界，例如 4096 / 5120 / 6144）；② `NINFER_TERNARY_TOKEN_GRID=1|0`（A3，结构开关，价值主要在 prefill）；③ `NINFER_TERNARY_KSPLIT=1|0`（A2，默认关）。扫法：A1 试 auto / 16 / 32；A3 试 on / off；A2 试 on / off —— **A2 必须先过数值门再谈收益**。三个 env 都必须在起服前设（图捕获时读死）。",
+      "judgement": "① **A1 / A3 必须逐位相同**：`--context 512 --stride 256` 与 `--context 32 --stride 16` 两种口径的 PPL 数字**完全相等**，且**贪心输出 sha 完全相同** —— 不成立就说明改错了地方，回退；② 过了数值门再看速度：**真交替、丢第一轮、3 次取中位数**，**prefill 与 decode 分别报**（A3 主要吃 prefill）；③ **A2 是唯一非逐位相同的**：必须过 **PPL 双口径 + 20 题**才谈收益；④ **提升不显著（<1%）就保持出厂默认**，不许写进结论当成果。",
+      "evidence": "我们卡（RTX 4080 SUPER，实测 80 SM）的**中间实测**（**[中间值 · 待最终判定]**，B 线最终一页纸出来后替换为最终中位数与四臂结果）：**prefill +30%（1,982.7 → 2,578.9 t/s）**、**decode +1.7%（89.8 → 91.3）**、**贪心 sha 两边相同**。等级 `measured(ours, 4080S)`。**其它卡一律 `hypothesis`，必须自己扫**（我们没在别的卡上量过）。",
+      "artifact": "NINFER_TERNARY_SMALL_T_ROWS / NINFER_TERNARY_TOKEN_GRID / NINFER_TERNARY_KSPLIT",
+      "applies_to_ids": ["A1", "A2", "A3"],
+      "not_applicable": "30 系（ninfer 档还没解锁 cc 门 ⇒ pending）；8~12 GB 省显档走 pr-ptq1-mmv 那条，别混"
+    }
+]

@@ -1,0 +1,36 @@
+{
+  "schema": "governance/1",
+  "note": "每条必做项的执行分权：blocking=不做后面就没意义；timebox_min=允许花多久（分钟）；fallback=达不到时的下一步（不是重试）。与 must-do.json 的 id 一一对应，两者合起来才是完整口径。",
+  "rule": "除 blocking=true 者外，任何项超时或只到可用线 ⇒ 登记 SKIP（读数+已试+原因）后继续；只有可行性失败才允许停下。",
+  "items": {
+    "C1": { "blocking": true,  "timebox_min": 0,  "fallback": "按默认口径继续（不许用短提示/单 token 的数下结论）" },
+    "C2": { "blocking": true,  "timebox_min": 0,  "fallback": "保持默认（前缀复用开）" },
+    "C3": { "blocking": false, "timebox_min": 10, "fallback": "按默认：MTP 档不开、dflash2 档必开" },
+    "C4": { "blocking": false, "timebox_min": 10, "fallback": "保持 1024" },
+    "C5": { "blocking": true,  "timebox_min": 0,  "fallback": "补齐后才报数" },
+    "C6": { "blocking": true,  "timebox_min": 0,  "fallback": "KVMem 开关一律不设（默认关）" },
+    "B1": { "blocking": false, "timebox_min": 30, "fallback": "保持预设 33 并登记 SKIP" },
+    "B2": { "blocking": false, "timebox_min": 30, "fallback": "保持预设 41 并登记 SKIP" },
+    "B2b":{ "blocking": false, "timebox_min": 60, "fallback": "不在本包，跳过" },
+    "B3": { "blocking": true,  "timebox_min": 10, "fallback": "按卡自动选（fp8 / 4-bit）" },
+    "B4": { "blocking": false, "timebox_min": 30, "fallback": "保持预设 K=3（MTP）/ 5~7（dflash2）" },
+    "B5": { "blocking": false, "timebox_min": 30, "fallback": "默认用 base，不切微调档" },
+    "E1": { "blocking": false, "timebox_min": 60, "fallback": "不重编，直接用出厂引擎（收益未量化）" },
+    "E2": { "blocking": false, "timebox_min": 60, "fallback": "跳过（单做它没有收益）" },
+    "A1": { "blocking": false, "timebox_min": 30, "fallback": "零收益 ⇒ 跳过并登记" },
+    "A2": { "blocking": false, "timebox_min": 30, "fallback": "负收益 ⇒ 默认关，跳过" },
+    "A3": { "blocking": false, "timebox_min": 90, "fallback": "不想自编就跳过（+31% prefill 只在自编引擎上存在）" },
+    "F1": { "blocking": false, "timebox_min": 30, "fallback": "前置未满足（没有自编引擎）⇒ 跳过" },
+    "D1": { "blocking": false, "timebox_min": 0,  "fallback": "不做" },
+    "D2": { "blocking": false, "timebox_min": 0,  "fallback": "不做" },
+    "D3": { "blocking": false, "timebox_min": 0,  "fallback": "不做" },
+    "D4": { "blocking": false, "timebox_min": 0,  "fallback": "不做" },
+    "D5": { "blocking": false, "timebox_min": 0,  "fallback": "不做" },
+    "D6": { "blocking": false, "timebox_min": 0,  "fallback": "不做" },
+    "D7": { "blocking": false, "timebox_min": 0,  "fallback": "不做（T=1 留在 gemv_tile）" }
+  },
+  "skip_ledger": {
+    "why": "跳过的项要留痕，回执时一并给我们（我们据此改文档与默认值）",
+    "fields": ["id", "读数", "已试步骤", "为什么停"]
+  }
+}

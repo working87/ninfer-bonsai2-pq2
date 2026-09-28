@@ -1,0 +1,24 @@
+# --- fork/package patch (2026-09-27) ------------------------------------------
+# -DNINFER_SM_COUNT=<n> must reach the compiler as a MACRO, otherwise the branch in
+# src/core/device.h is dead code and a "successful" rebuild silently keeps the
+# per-arch default (this is exactly the "compile succeeded != compiled correctly"
+# trap our own docs warn about). 0 = no override, use the per-arch default.
+set(NINFER_SM_COUNT "0" CACHE STRING
+  "Streaming-multiprocessor count of the card this build targets (0 = per-arch default)")
+if(NOT NINFER_SM_COUNT MATCHES "^[0-9]+$")
+  message(FATAL_ERROR
+    "NINFER_SM_COUNT='${NINFER_SM_COUNT}' is not a number; read yours with gpu-probe.exe")
+endif()
+if(NINFER_SM_COUNT EQUAL 0)
+  if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(120|120a)")
+    set(NINFER_SM_COUNT 170)   # RTX 5090 -- matches the shipped sm_120 engine
+  else()
+    set(NINFER_SM_COUNT 128)   # RTX 4090 -- matches the shipped sm_89 engine
+  endif()
+  message(STATUS
+    "NINFER_SM_COUNT not given -> per-arch default ${NINFER_SM_COUNT}. Read your own card "
+    "with gpu-probe.exe and pass -DNINFER_SM_COUNT=<n> to target it exactly.")
+endif()
+add_compile_definitions(NINFER_SM_COUNT=${NINFER_SM_COUNT})
+message(STATUS "NInfer target: CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES} SM_COUNT=${NINFER_SM_COUNT}")
+

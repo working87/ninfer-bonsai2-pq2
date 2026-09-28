@@ -1,0 +1,14 @@
+[
+    {
+      "id": "B5",
+      "title": "权重选择：默认用 base，Swift 只当「省 token 但掉分」的可选项",
+      "class": "B",
+      "applies_to": "both",
+      "rebuild_required": false,
+      "why": "同一引擎同一口径下 Swift 不如 base：题集 16/20 vs 19/20 且 3 道确定性答错；思考 token 均值 -22.9% 但中位数只有 -6.6%（说明省的是少数长尾，不是普遍变短）⇒ 省 token 换掉分，不划算。",
+      "how": "默认用 model\\bonsai2_27b_ternary_v2.ninfer（base）。只有在显存/延迟硬受限（8 GB 档）且能接受掉分时，才试 Swift 制品；换制品后必须重跑题集，不要只看 token 数。",
+      "judgement": "题集不低于 base（我们口径 19/20）；若题集掉到 16/20 那一档，就没有理由换。报数带内容类型 + 接受率 + 引擎 sha（C5）。",
+      "evidence": "我们实测（同引擎同口径）：Swift 16/20 vs base 19/20、3 道确定性答错；思考 token 均值 -22.9%、中位数仅 -6.6%。出处 docs/引擎-模型-参数对照表.md §4.5 权重选择一节。",
+      "artifact": "model\\bonsai2_27b_ternary_v2.ninfer (base)"
+    }
+]

@@ -1,0 +1,242 @@
+diff --git a/src-tree/ninfer-4090w-ternary/src/ops/linear/ternary/ternary_rowsplit_gemm.cu b/sched3-patch/files/ternary_rowsplit_gemm.cu
+--- a/src-tree/ninfer-4090w-ternary/src/ops/linear/ternary/ternary_rowsplit_gemm.cu
++++ b/sched3-patch/files/ternary_rowsplit_gemm.cu
+@@ -13,6 +13,7 @@
+ #include <cstring>
+ #include <stdexcept>
+ #include <string>
++#include <type_traits>
+ 
+ namespace ninfer::ops::detail {
+ namespace {
+@@ -168,11 +169,15 @@ void launch_pq2_mma_wide_t(const Tensor& x, const Weight& w, Tensor& out,
+                            std::int32_t out_row_stride, std::int32_t tokens,
+                            cudaStream_t stream) {
+     // Static shared memory again (42.25 KB at BN=64), so no dynamic size and no opt-in.
+-    const unsigned grid = static_cast<unsigned>(div_up(w.n, kTernaryWideRowsPerCta));
++    // SCHED3 CHANGE 3: the token axis is grid.y, one CTA per 64-token tile.
++    const bool token_grid = ternary_token_grid_enabled();
++    const dim3 grid(static_cast<unsigned>(div_up(w.n, kTernaryWideRowsPerCta)),
++                    token_grid ? static_cast<unsigned>(div_up(tokens, kTernaryWideTokens)) : 1u,
++                    1u);
+     ternary_wide_t_kernel<false><<<grid, kTernaryWideThreads, 0, stream>>>(
+         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+         nullptr, static_cast<const std::uint8_t*>(w.scales),
+-        static_cast<__nv_bfloat16*>(out.data), w.n, w.k, tokens, out_row_stride);
++        static_cast<__nv_bfloat16*>(out.data), w.n, w.k, tokens, out_row_stride, token_grid);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+@@ -184,11 +189,14 @@ void launch_ptq1_mma_wide_t(const Tensor& x, const Weight& w, Tensor& out,
+     if (w.qhigh == nullptr) {
+         throw std::invalid_argument("ternary wide-t mma: PTQ1_0 needs its high plane");
+     }
+-    const unsigned grid = static_cast<unsigned>(div_up(w.n, kTernaryWideRowsPerCta));
++    const bool token_grid = ternary_token_grid_enabled();
++    const dim3 grid(static_cast<unsigned>(div_up(w.n, kTernaryWideRowsPerCta)),
++                    token_grid ? static_cast<unsigned>(div_up(tokens, kTernaryWideTokens)) : 1u,
++                    1u);
+     ternary_wide_t_kernel<true><<<grid, kTernaryWideThreads, 0, stream>>>(
+         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+         static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
+-        static_cast<__nv_bfloat16*>(out.data), w.n, w.k, tokens, out_row_stride);
++        static_cast<__nv_bfloat16*>(out.data), w.n, w.k, tokens, out_row_stride, token_grid);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+@@ -315,34 +323,119 @@ bool mma_admits(const Weight& w, std::int32_t out_row_stride) {
+            (w.k % kTernaryMmaChunkK) == 0 && out_row_stride >= w.n;
+ }
+ 
++// ================================================================================================
++// SCHED3: the small-t launcher carries all three scheduling changes.
++// ================================================================================================
++// One templated launcher instead of two near-identical ones, because the row block (change 1) has
++// to be a template argument: the kernel is instantiated for 16/32/48 rows per warp and the shape
++// picks one at run time, so the format twin and the row-block twin would otherwise multiply out
++// into six hand-written launch sites.
++//
++// CHANGE 1 -- rows per warp from `n` (ternary_mma_rows_per_warp), but ONLY where the shared-memory
++//             budget allows the wider block: the row block is 38,144 B at <PQ2_0, 16 rows> and
++//             57,600 B at <PQ2_0, 32 rows>, over the 48 KB static cap, so the PQ2_0 wide block is
++//             never instantiated (`wide_allowed` is false for it and the shape falls back to 16).
++//             <PTQ1_0, 32 rows> is 40,192 B and is built. The exact table is at kTernaryMmaRowsWide.
++// CHANGE 2 -- when the gate admits it (ternary_mma_ksplit_shards: T <= 8, n <= 6144, >= 4 chunks per
++//             shard), the K chunks are launched as two shards on the same stream. Shard 0 stores,
++//             shard 1 accumulates into shard 0's output; the stream order is the reduction order.
++//             OFF by default -- it is the one change that is not bit-identical.
++// CHANGE 3 -- the token axis goes into grid.y (one CTA per 8-token tile) unless
++//             NINFER_TERNARY_TOKEN_GRID=0, which restores the serial walk as the A/B control.
++template <bool kPtq1>
++void launch_small_t_shape(const Tensor& x, const Weight& w, Tensor& out,
++                          std::int32_t out_row_stride, std::int32_t tokens,
++                          cudaStream_t stream) {
++    const auto* x_ptr  = static_cast<const __nv_bfloat16*>(x.data);
++    const auto* codes  = static_cast<const std::uint8_t*>(w.qdata);
++    const auto* high   = kPtq1 ? static_cast<const std::uint8_t*>(w.qhigh) : nullptr;
++    const auto* scales = static_cast<const std::uint8_t*>(w.scales);
++    auto* out_ptr      = static_cast<__nv_bfloat16*>(out.data);
++
++    const std::int32_t rows = w.n;
++    const bool token_grid   = ternary_token_grid_enabled();
++    // THE CHUNK WIDTH IS A PER-FORMAT QUANTITY, and getting it wrong here is silent, not loud:
++    // PQ2_0 stages 512-wide chunks (kTernaryMmaChunkK) while PTQ1_0 stages 256-wide ones
++    // (kTernaryMmaPtq1ChunkK), because a 256-wide chunk is what lets three PTQ1_0 CTAs fit per SM.
++    // The kernel derives its own range from `Geom::kChunkK`, so this launcher has to agree with it:
++    // using the PQ2_0 width for PTQ1_0 asks for 10 chunks where there are 20 and the kernel then
++    // walks HALF of K -- correct-looking, finite, and completely wrong (measured: PTQ1_0 perplexity
++    // 121.1577 -> 22123.9 at the 8/4 window, while PQ2_0 stayed bit-exact and hid the mistake).
++    constexpr std::int32_t kChunkK = kPtq1 ? kTernaryMmaPtq1ChunkK : kTernaryMmaChunkK;
++    const std::int32_t chunks      = w.k / kChunkK;
++    const int shards               = ternary_mma_ksplit_shards(rows, w.k, tokens, kChunkK);
++    // The gate only ever returns a divisor of `chunks`, so the split is exact: the shards partition
++    // [0, chunks) with no gap and no overlap. Asserted rather than assumed -- a shard boundary off
++    // a whole chunk would silently drop or double-count weight rows.
++    const std::int32_t shard_chunks = chunks / shards;
++    // Belt and braces for the bug above: the shard partition must cover exactly the chunks the
++    // kernel will walk.
++    if (chunks * kChunkK != w.k) {
++        throw std::invalid_argument("ternary small-t mma: K is not a whole number of chunks");
++    }
++
++    const auto run = [&](auto rows_tag) {
++        constexpr int kRowsPerWarp = decltype(rows_tag)::value;
++        constexpr int kRowsPerCta  = kRowsPerWarp * kTernaryMmaWarpsPerCta;
++        const unsigned grid_y =
++            token_grid ? static_cast<unsigned>(div_up(tokens, kTernaryMmaTokens)) : 1u;
++        const dim3 grid(static_cast<unsigned>(div_up(rows, kRowsPerCta)), grid_y, 1u);
++        for (int shard = 0; shard < shards; ++shard) {
++            const std::int32_t chunk_lo = shard * shard_chunks;
++            const std::int32_t chunk_hi =
++                (shard + 1 == shards) ? chunks : (shard + 1) * shard_chunks;
++            ternary_mma_small_t_kernel<kPtq1, kRowsPerWarp>
++                <<<grid, kTernaryMmaThreads, 0, stream>>>(x_ptr, codes, high, scales, out_ptr, rows,
++                                                          w.k, tokens, out_row_stride, chunk_lo,
++                                                          chunk_hi, token_grid, shard > 0);
++            CUDA_CHECK(cudaGetLastError());
++        }
++    };
++
++    using std::integral_constant;
++    // `if constexpr` IS LOAD-BEARING HERE, not a style choice. Only two row blocks can be built --
++    // 16 for both formats, 32 for PTQ1_0 alone -- and the PQ2_0 32-row kernel is 57,600 B of static
++    // shared against a 49,152 B cap. A runtime `if` compiles BOTH branches for BOTH formats, which
++    // is what actually happened on the first build of this change:
++    //
++    //     nvlink error : Entry function '...ternary_mma_small_t_kernelILb0ELi32EEE...'
++    //       uses too much shared data (0xe100 bytes, 0xc000 max)
++    //
++    // 0xe100 == 57,600 and 0xc000 == 49,152, i.e. the predicted footprint, reported at DEVICE LINK
++    // time rather than by the compiler -- every TU compiled "successfully". Hence the
++    // `if constexpr`: the PQ2_0 branch must not instantiate the wide block at all.
++    if constexpr (kPtq1) {
++        if (ternary_mma_rows_per_warp(rows, true) == kTernaryMmaRowsWide) {
++            run(integral_constant<int, kTernaryMmaRowsWide>{});
++        } else {
++            run(integral_constant<int, kTernaryMmaRowsNarrow>{});
++        }
++    } else {
++        // PQ2_0: 16 rows per warp on every shape, whatever the environment asks for. The wide
++        // block exists only for PTQ1_0 (footprint table at kTernaryMmaRowsWide), so asking for it
++        // here has to clamp rather than instantiate.
++        (void)ternary_mma_rows_per_warp(rows, false);
++        run(integral_constant<int, kTernaryMmaRowsNarrow>{});
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// PQ2_0 entry: formats are told apart exactly once, here, as everywhere else in this file.
+ void launch_pq2_mma_small_t(const Tensor& x, const Weight& w, Tensor& out,
+                             std::int32_t out_row_stride, std::int32_t tokens,
+                             cudaStream_t stream) {
+-    // The staging is static shared memory (a compile-time 32 KB), so there is no dynamic size to
+-    // pass and no cudaFuncSetAttribute opt-in to make.
+-    const unsigned grid = static_cast<unsigned>(div_up(w.n, kTernaryMmaRowsPerCta));
+-    ternary_mma_small_t_kernel<false><<<grid, kTernaryMmaThreads, 0, stream>>>(
+-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+-        nullptr, static_cast<const std::uint8_t*>(w.scales),
+-        static_cast<__nv_bfloat16*>(out.data), w.n, w.k, tokens, out_row_stride);
+-    CUDA_CHECK(cudaGetLastError());
++    launch_small_t_shape<false>(x, w, out, out_row_stride, tokens, stream);
+ }
+ 
+-// PTQ1_0 twin: same kernel, same grid, same everything below the repack. Its static shared is
+-// 46.25 KB instead of 32 KB (three rotating weight-row buffers instead of two -- see
+-// kTernaryMmaPtq1WeightBufs), still under the 48 KB static cap and still two CTAs per SM.
++// PTQ1_0 twin: the high plane is mandatory (the native decoder reads it), and everything else --
++// grid, row block, chunk range -- is shared with the PQ2_0 entry above.
+ void launch_ptq1_mma_small_t(const Tensor& x, const Weight& w, Tensor& out,
+                              std::int32_t out_row_stride, std::int32_t tokens,
+                              cudaStream_t stream) {
+     if (w.qhigh == nullptr) {
+         throw std::invalid_argument("ternary small-t mma: PTQ1_0 needs its high plane");
+     }
+-    const unsigned grid = static_cast<unsigned>(div_up(w.n, kTernaryMmaRowsPerCta));
+-    ternary_mma_small_t_kernel<true><<<grid, kTernaryMmaThreads, 0, stream>>>(
+-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+-        static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
+-        static_cast<__nv_bfloat16*>(out.data), w.n, w.k, tokens, out_row_stride);
+-    CUDA_CHECK(cudaGetLastError());
++    launch_small_t_shape<true>(x, w, out, out_row_stride, tokens, stream);
+ }
+ 
+ // One call site for both ternary formats, exactly like the GEMV and wide-t dispatchers.
+@@ -367,12 +460,14 @@ void launch_pq2_mma_s8(const Tensor& x, const Weight& w, Tensor& out,
+ 
+     constexpr int kTokens = 64;
+     constexpr int kWarps  = 4;
+-    const unsigned grid =
+-        static_cast<unsigned>(div_up(w.n, TernaryS8Storage<kTokens, kWarps>::kRowsPerCta));
++    // SCHED3 CHANGE 3: the token axis is grid.y, one CTA per 64-token tile.
++    const bool token_grid = ternary_token_grid_enabled();
++    const dim3 grid(static_cast<unsigned>(div_up(w.n, TernaryS8Storage<kTokens, kWarps>::kRowsPerCta)),
++                    token_grid ? static_cast<unsigned>(div_up(tokens, kTokens)) : 1u, 1u);
+     ternary_pq2_mma_s8_kernel<kTokens, kWarps, 3><<<grid, kWarps * 32, 0, stream>>>(
+         scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(w.qdata),
+         static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), w.n,
+-        w.k, tokens, out_row_stride);
++        w.k, tokens, out_row_stride, nullptr, token_grid);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+@@ -397,12 +492,14 @@ void launch_ptq1_mma_s8(const Tensor& x, const Weight& w, Tensor& out,
+     constexpr int kWarps  = 4;
+     // Same rows-per-CTA as the PQ2_0 instantiation (it is kTernaryS8RowsPerWarp * kWarps in both),
+     // named through the PTQ1 storage so the two can never drift apart silently.
+-    const unsigned grid = static_cast<unsigned>(
+-        div_up(w.n, TernaryS8Storage<kTokens, kWarps, true>::kRowsPerCta));
++    const bool token_grid = ternary_token_grid_enabled();
++    const dim3 grid(
++        static_cast<unsigned>(div_up(w.n, TernaryS8Storage<kTokens, kWarps, true>::kRowsPerCta)),
++        token_grid ? static_cast<unsigned>(div_up(tokens, kTokens)) : 1u, 1u);
+     ternary_pq2_mma_s8_kernel<kTokens, kWarps, 3, true><<<grid, kWarps * 32, 0, stream>>>(
+         scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(w.qdata),
+         static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), w.n,
+-        w.k, tokens, out_row_stride, static_cast<const std::uint8_t*>(w.qhigh));
++        w.k, tokens, out_row_stride, static_cast<const std::uint8_t*>(w.qhigh), token_grid);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+@@ -471,14 +568,20 @@ void launch_ternary_gemm_t8(const Tensor& x, const Weight& w, Tensor& out,
+         std::fprintf(stderr,
+                      "[ternary] rung=%s fmt=%s qtype=%d T=%d k=%d n=%d stride=%d wide_admits=%d "
+                      "small_admits=%d gemv_admits=%d s8_scratch=%d s8_switch=%d s8_min=%d mma=%d "
+-                     "ptq1_fast=%d\n",
++                     "ptq1_fast=%d small_rows=%d token_grid=%d ksplit_shards=%d\n",
+                      rung, probe_fmt, static_cast<int>(w.qtype), static_cast<int>(x.ne[1]),
+                      static_cast<int>(w.k), static_cast<int>(w.n),
+                      static_cast<int>(out_row_stride), mma_wide_admits(w, out_row_stride) ? 1 : 0,
+                      mma_admits(w, out_row_stride) ? 1 : 0, gemv_admits(x, w, 4) ? 1 : 0,
+                      scratch.codes != nullptr ? 1 : 0, ternary_s8_enabled() ? 1 : 0,
+                      kTernaryS8MinTokens, ternary_mma_enabled() ? 1 : 0,
+-                     ternary_ptq1_fast_enabled() ? 1 : 0);
++                     ternary_ptq1_fast_enabled() ? 1 : 0,
++                     ternary_mma_rows_per_warp(w.n, w.qtype == QType::PTQ1_0_G128),
++                     ternary_token_grid_enabled() ? 1 : 0,
++                     ternary_mma_ksplit_shards(w.n, w.k, x.ne[1],
++                                               w.qtype == QType::PTQ1_0_G128
++                                                   ? kTernaryMmaPtq1ChunkK
++                                                   : kTernaryMmaChunkK));
+     };
+     if (scratch.codes != nullptr && scratch.scales != nullptr && ternary_s8_enabled() &&
+         ternary_mma_enabled() &&
