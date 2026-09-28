@@ -11,24 +11,19 @@
 
 ---
 
-## 🤖 交给 AI Agent 一键部署
+## 🤖 交给 AI Agent 部署
 
-把本仓库发给 agent（Claude Code、Codex、Cursor 等），说一句“按 AGENTS.md 部署”即可。手动部署：
+把本仓库 clone 到**纯英文路径**，发给 agent（Claude Code、Codex、Cursor 等），说一句“按 AGENTS.md 部署”即可。
+agent 会按原作者的指南（`00-从这里开始.md`）在你的机器上探测显卡、选择档位，再按需下载。
 
-```powershell
-git clone <本仓库地址> D:\ai\ninfer-pq2 ; cd D:\ai\ninfer-pq2      # 路径必须是纯英文
-powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1
-```
-
-git 仓库里没有放大文件，`deploy.ps1` 会按你的显卡**只从国内源**下载，逐个做 SHA256 校验，支持断点续传：
+git 仓库里没有放大文件，**全部下载地址都在 [DOWNLOADS.md](DOWNLOADS.md)**，都是国内源，附 SHA256，缺啥下啥：
 
 | 内容 | 国内来源 |
 |---|---|
 | 引擎 `ninfer-serve.exe`（sm_89，40 系）/ `ninfer-serve-sm120.exe`（sm_120，50 系）+ 7 个 ffmpeg dll | 魔搭 [working87/ninfer-bonsai2-pq2-engine](https://www.modelscope.cn/models/working87/ninfer-bonsai2-pq2-engine)（沈三殊编译，原样转发） |
 | 模型 `bonsai2_27b_ternary_v2.ninfer`（8.31 GB）/ `…-dflash2.ninfer`（10.53 GB） | 魔搭 [w3c0929/Ternary-Bonsai-2-27B-NInfer](https://www.modelscope.cn/models/w3c0929/Ternary-Bonsai-2-27B-NInfer)（与原包 SHA256 逐位一致） |
-| VC++ 运行库（仅在系统缺失时下载） | 清华 PyPI 镜像 `msvc-runtime` |
 
-下载完成后，目录结构和原包完全一样，下文说明全部适用。`src-tree\…\ffmpeg\bin` 里的 7 个 dll 也会由脚本自动补齐。
+下载的文件放回对应目录后，目录结构就和原包完全一样，下文说明全部适用。
 
 > 以下为原包 README 原文。
 
